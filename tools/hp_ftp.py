@@ -7,6 +7,8 @@
     python3 hp_ftp.py backup   --host www.example.ne.jp --user cb00000 --dest ./backup
     python3 hp_ftp.py wipe     --host www.example.ne.jp --user cb00000 --backup ./backup
     python3 hp_ftp.py redirect --host www.example.ne.jp --user cb00000 --to https://new.example.com/
+    python3 hp_ftp.py stubs    --host www.example.ne.jp --user cb00000 --to https://new.example.com/
+    python3 hp_ftp.py rm       --host www.example.ne.jp --user cb00000 --path public_html/.htaccess
 
 パスワードは getpass で聞くので、コマンド履歴には残らない。
 環境変数 FTP_PASSWORD に入れておけばそちらを使う。
@@ -498,12 +500,105 @@ def cmd_redirect(ftp: ftplib.FTP, args) -> int:
     return 0 if ok and not leftover and not stats.errors else 1
 
 
+# 全パスを新URLへ301転送する Apache 設定。サーバーが .htaccess を許可して
+# いれば、存在しなかったURLへのアクセスまで含めて全部転送できる。
+HTACCESS_BODY = "RedirectMatch 301 ^ {url}\n"
+
+
+def cmd_stubs(ftp: ftplib.FTP, args) -> int:
+    """バックアップの目録を元に、旧ページ全部の位置へ転送ページを復元配置する。
+
+    redirect はトップに index.html を 1 枚置くだけなので、検索結果や外部リンクが
+    直接指している下層ページ (/hanbai/ など) は 404 になる。この命令は
+    「昔 .html があった場所」と「昔ディレクトリがあった場所の index.html」に
+    同じ転送ページを置いて、どこから入っても新URLへ飛ぶようにする。
+    アップロードのみで何も削除しない。
+    """
+    mpath = os.path.join(args.backup, MANIFEST)
+    if not os.path.isfile(mpath):
+        raise SystemExit(f"バックアップ目録が見つかりません: {mpath}\n"
+                         "redirect / backup を実行した時の --dest を --backup に指定してください。")
+    with open(mpath, encoding="utf-8") as fh:
+        saved = json.load(fh)
+    if not saved["files"]:
+        raise SystemExit("目録が空です。復元すべき旧ページの情報がありません。")
+    root = (saved.get("root") or "").rstrip("/")
+
+    # 旧構成から「転送ページを置くべき場所」を割り出す
+    dirs: set[str] = set()
+    for f in saved["files"]:
+        d = posixpath.dirname(f["remote"])
+        while d and d != root:
+            dirs.add(d)
+            d = posixpath.dirname(d)
+    targets = {posixpath.join(d, "index.html") for d in dirs}
+    targets.update(f["remote"] for f in saved["files"]
+                   if f["remote"].lower().endswith((".html", ".htm")))
+
+    body = make_redirect_html(args.to)
+    print(f"リダイレクト先: {args.to}")
+    print(f"旧構成: ファイル {len(saved['files'])} 個 → "
+          f"ディレクトリ {len(dirs)} 個を作り直し、転送ページを {len(targets)} 箇所に設置します\n")
+    for t in sorted(targets):
+        print(f"  設置: {disp(t)}")
+    if args.htaccess:
+        ht = posixpath.join(root, ".htaccess") if root else ".htaccess"
+        print(f"  設置: {disp(ht)} (全URLを301転送する設定ファイル)")
+    if args.dry_run:
+        print("\n--dry-run のため、何も変更していません。")
+        return 0
+
+    stats = Stats()
+    for d in sorted(dirs, key=lambda p: p.count("/")):  # 浅い階層から作る
+        try:
+            ftp.mkd(d)
+            print(f"  作成 {disp(d)}/")
+        except ftplib.error_perm:
+            pass  # 既にあるならそれでよい
+    ok = 0
+    for t in sorted(targets):
+        try:
+            ftp.storbinary(f"STOR {t}", io.BytesIO(body))
+            ok += 1
+            print(f"  OK {disp(t)}")
+        except Exception as ex:  # noqa: BLE001
+            stats.errors.append(f"設置失敗 {disp(t)}: {ex}")
+    if args.htaccess:
+        ht = posixpath.join(root, ".htaccess") if root else ".htaccess"
+        try:
+            ftp.storbinary(f"STOR {ht}",
+                           io.BytesIO(HTACCESS_BODY.format(url=args.to).encode()))
+            print(f"  OK {disp(ht)}")
+            print("\n  ※ .htaccess 設置後は必ずトップページが開けるか確認してください。"
+                  "\n     もしサイト全体がエラーになったら、このサーバーでは許可されていないので"
+                  f"\n     rm --path {disp(ht)} で取り除けば元に戻ります。")
+        except Exception as ex:  # noqa: BLE001
+            stats.errors.append(f".htaccess 設置失敗: {ex}")
+
+    print(f"\n完了: {ok}/{len(targets)} 箇所に転送ページを設置しました。")
+    for err in stats.errors:
+        print(f"  ! {err}", file=sys.stderr)
+    return 1 if stats.errors else 0
+
+
+def cmd_rm(ftp: ftplib.FTP, args) -> int:
+    """指定した 1 ファイルだけを削除する（.htaccess の撤去など）。"""
+    try:
+        ftp.delete(args.path)
+    except ftplib.error_perm as e:
+        print(f"削除できませんでした: {e}", file=sys.stderr)
+        return 1
+    print(f"削除しました: {disp(args.path)}")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="ホームページ領域を FTP でバックアップ / 確認 / 削除する",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
-    p.add_argument("command", choices=["list", "backup", "wipe", "redirect"])
+    p.add_argument("command",
+                   choices=["list", "backup", "wipe", "redirect", "stubs", "rm"])
     p.add_argument("--host", required=True, help="FTP サーバー名")
     p.add_argument("--user", required=True, help="FTP ユーザー名")
     p.add_argument("--port", type=int, default=21)
@@ -518,14 +613,19 @@ def main() -> int:
                    help="backup/redirect: バックアップ保存先")
     p.add_argument("--backup", default="./hp-backup", help="wipe: 確認に使うバックアップ")
     p.add_argument("--dry-run", action="store_true",
-                   help="wipe/redirect: 変更せずに対象だけ表示")
-    p.add_argument("--to", help="redirect: 飛ばし先 URL (https://... )")
+                   help="wipe/redirect/stubs: 変更せずに対象だけ表示")
+    p.add_argument("--to", help="redirect/stubs: 飛ばし先 URL (https://... )")
+    p.add_argument("--htaccess", action="store_true",
+                   help="stubs: 全URLを301転送する .htaccess も設置する")
+    p.add_argument("--path", help="rm: 削除するファイルのリモートパス")
     args = p.parse_args()
 
-    if args.command == "redirect":
+    if args.command in ("redirect", "stubs"):
         u = urllib.parse.urlparse(args.to or "")
         if u.scheme not in ("http", "https") or not u.netloc:
-            p.error("redirect には --to https://新しいページのURL が必要です")
+            p.error(f"{args.command} には --to https://新しいページのURL が必要です")
+    if args.command == "rm" and not args.path:
+        p.error("rm には --path <リモートパス> が必要です")
 
     password = os.environ.get("FTP_PASSWORD") or getpass.getpass("FTP パスワード: ")
 
@@ -543,7 +643,8 @@ def main() -> int:
 
     try:
         return {"list": cmd_list, "backup": cmd_backup, "wipe": cmd_wipe,
-                "redirect": cmd_redirect}[args.command](ftp, args)
+                "redirect": cmd_redirect, "stubs": cmd_stubs,
+                "rm": cmd_rm}[args.command](ftp, args)
     finally:
         try:
             ftp.quit()
