@@ -26,11 +26,32 @@ import sys
 import urllib.parse
 from dataclasses import dataclass, field
 
-# 2000年代の国内 ISP のホームページ領域は、ファイル名が Shift_JIS のことが多い。
-# cp932 -> utf-8 の順で試す。
-ENCODINGS = ("cp932", "utf-8", "latin-1")
+# FTP セッション自体は常に latin-1（= 生バイトを 1:1 で保持する表現）で張る。
+# こうするとサーバー上のファイル名がどんな文字コードでも、DELETE/RETR に
+# 全く同じバイト列を送り返せるので、操作が絶対に化けない。
+# 人間向けの表示とローカル保存名だけ、下の優先順で復号を試す。
+# 2000年代の国内 ISP は Shift_JIS(cp932) と UTF-8 の混在がよくある。
+DISPLAY_ENCODINGS = ["utf-8", "cp932"]
 
 MANIFEST = "manifest.json"
+
+# 一般的な公開ディレクトリ名。ログイン直下にこれがあるのに --remote-root 未指定で
+# 破壊的操作をしようとしたら、間違った階層ごと消さないよう必ず止める。
+DOCROOT_CANDIDATES = ("public_html", "www", "htdocs", "public")
+
+
+def disp(raw: str) -> str:
+    """latin-1 表現の生ファイル名を、人間が読める形に復号する（表示専用）。"""
+    try:
+        b = raw.encode("latin-1")
+    except UnicodeEncodeError:
+        return raw  # コマンドライン引数など、既に普通の文字列だった
+    for enc in DISPLAY_ENCODINGS:
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw
 
 
 @dataclass
@@ -48,64 +69,25 @@ class Stats:
     errors: list[str] = field(default_factory=list)
 
 
-def connect(host: str, user: str, password: str, *, encoding: str,
-            use_tls: bool, port: int, timeout: int) -> ftplib.FTP:
-    cls = ftplib.FTP_TLS if use_tls else ftplib.FTP
-    ftp = cls(timeout=timeout)
-    ftp.encoding = encoding
-    ftp.connect(host, port)
-    ftp.login(user, password)
-    if use_tls:
-        ftp.prot_p()
-    ftp.set_pasv(True)  # NAT 越しはパッシブでないと繋がらない
-    return ftp
+def connect_raw(args, password: str) -> ftplib.FTP:
+    """生バイト保持モード (latin-1) で接続する。
 
-
-def _connect(args, password: str, enc: str) -> ftplib.FTP:
+    セッションの文字コードは常に latin-1。ファイル名の見た目は disp() が
+    utf-8 → cp932 の順で復号する（--encoding で先頭を差し替え可能）。
+    """
+    cls = ftplib.FTP_TLS if args.tls else ftplib.FTP
+    ftp = cls(timeout=args.timeout)
+    ftp.encoding = "latin-1"
     try:
-        return connect(args.host, args.user, password, encoding=enc,
-                       use_tls=args.tls, port=args.port, timeout=args.timeout)
+        ftp.connect(args.host, args.port)
+        ftp.login(args.user, password)
     except ftplib.error_perm as e:
         raise SystemExit(f"ログイン失敗: {e}\n"
                          "ユーザー名 / パスワードを確認してください。") from e
-
-
-def connect_autodetect(args, password: str) -> tuple[ftplib.FTP, str]:
-    """日本語ファイル名が化けない文字コードで接続する。
-
-    まず FEAT を見て、サーバーが UTF8 を名乗ればそれを信じる。名乗らなければ
-    古いサーバーなので、国内 ISP なら Shift_JIS(cp932) の可能性が高い。
-    それでも化ける場合は --encoding で明示指定する。
-    """
-    if args.encoding:
-        return _connect(args, password, args.encoding), args.encoding
-
-    ftp = _connect(args, password, "utf-8")
-    try:
-        advertises_utf8 = "UTF8" in ftp.sendcmd("FEAT").upper()
-    except (ftplib.error_perm, ftplib.error_proto, UnicodeDecodeError):
-        advertises_utf8 = False
-    if advertises_utf8:
-        return ftp, "utf-8"
-    ftp.close()
-
-    last: object = None
-    for enc in ENCODINGS:
-        try:
-            ftp = _connect(args, password, enc)
-        except Exception as e:  # noqa: BLE001 - 接続系は何が来るか分からない
-            last = e
-            continue
-        try:
-            ftp.nlst(args.remote_root)  # 実際に一覧を読んで化けないか確かめる
-            return ftp, enc
-        except UnicodeDecodeError:
-            ftp.close()
-            last = f"{enc} でデコード失敗"
-            continue
-        except ftplib.error_perm:
-            return ftp, enc  # 空ディレクトリ等。接続自体は成立している
-    raise SystemExit(f"接続できませんでした: {last}")
+    if args.tls:
+        ftp.prot_p()
+    ftp.set_pasv(True)  # NAT 越しはパッシブでないと繋がらない
+    return ftp
 
 
 # Unix の LIST 行は先頭がファイル種別 + パーミッション（例 -rw-r--r-- / drwxr-xr-x）。
@@ -140,6 +122,29 @@ def _parse_dos(line: str) -> tuple[str, bool, int] | None:
         return None
 
 
+def _raw_list(ftp: ftplib.FTP, path: str) -> list[str]:
+    """LIST 応答を生バイトで受けて latin-1 の行リストにする。
+
+    ftplib.retrlines はセッション文字コードで復号しながら読むため、想定外の
+    バイト列に当たると転送の途中で例外になり、制御チャネルの応答がずれて
+    以後のコマンドが全部おかしくなる（Type set to A が返る等）。
+    生で受けて後から復号すれば、どんなファイル名でも転送は必ず完走する。
+    """
+    ftp.voidcmd("TYPE A")
+    chunks: list[bytes] = []
+    conn = ftp.transfercmd(f"LIST {path}" if path else "LIST")
+    try:
+        while True:
+            chunk = conn.recv(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        conn.close()
+    ftp.voidresp()
+    return b"".join(chunks).decode("latin-1").splitlines()
+
+
 def list_entries(ftp: ftplib.FTP, path: str) -> tuple[list[Entry], list[str]]:
     """path 直下のエントリと、解釈できなかった行を返す。
 
@@ -162,15 +167,14 @@ def list_entries(ftp: ftplib.FTP, path: str) -> tuple[list[Entry], list[str]]:
     except (ftplib.error_perm, ftplib.error_proto, AttributeError):
         pass  # 古いサーバーは MLSD 非対応
 
-    lines: list[str] = []
-    ftp.retrlines(f"LIST {path}" if path else "LIST", lines.append)
+    lines = _raw_list(ftp, path)
     out, unparsed = [], []
     for line in lines:
         if not line.strip() or line.lower().startswith("total "):
             continue
         parsed = _parse_unix(line) or _parse_dos(line)
         if parsed is None:
-            unparsed.append(f"{path or '/'}: {line}")
+            unparsed.append(f"{disp(path) or '/'}: {disp(line)}")
             continue
         name, is_dir, size = parsed
         if name in (".", ".."):
@@ -194,7 +198,7 @@ def walk(ftp: ftplib.FTP, root: str, stats: Stats) -> list[Entry]:
         try:
             entries, unparsed = list_entries(ftp, cur)
         except Exception as e:  # noqa: BLE001
-            stats.errors.append(f"一覧取得失敗 {cur}: {e}")
+            stats.errors.append(f"一覧取得失敗 {disp(cur)}: {e}")
             continue
         for line in unparsed:
             stats.errors.append(f"一覧の行を解釈できず（取りこぼしの可能性）: {line}")
@@ -223,7 +227,7 @@ def cmd_list(ftp: ftplib.FTP, args) -> int:
     for e in sorted(entries, key=lambda x: x.path):
         mark = "[DIR] " if e.is_dir else "      "
         size = "" if e.is_dir else f"  {human(e.size)}"
-        print(f"{mark}{e.path}{size}")
+        print(f"{mark}{disp(e.path)}{size}")
     print(f"\nファイル {stats.files} 個 / ディレクトリ {stats.dirs} 個 / "
           f"合計 {human(stats.bytes)}")
     for err in stats.errors:
@@ -262,7 +266,8 @@ def download_entries(ftp: ftplib.FTP, entries: list[Entry], root: str,
     """entries のファイルを dest へ保存し、目録リストを返す。"""
     manifest = []
     for e in sorted(entries, key=lambda x: x.path):
-        rel = e.path[len(root):].lstrip("/") if root else e.path.lstrip("/")
+        raw_rel = e.path[len(root):].lstrip("/") if root else e.path.lstrip("/")
+        rel = disp(raw_rel)  # ローカルの保存名は読める形にする
         local = os.path.join(dest, *rel.split("/"))
         if e.is_dir:
             os.makedirs(local, exist_ok=True)
@@ -272,13 +277,14 @@ def download_entries(ftp: ftplib.FTP, entries: list[Entry], root: str,
             with open(local, "wb") as fh:
                 ftp.retrbinary(f"RETR {e.path}", fh.write)
         except Exception as ex:  # noqa: BLE001
-            stats.errors.append(f"取得失敗 {e.path}: {ex}")
+            stats.errors.append(f"取得失敗 {disp(e.path)}: {ex}")
             print(f"  ! 失敗 {rel}")
             continue
         got = os.path.getsize(local)
         # サーバー申告サイズと突き合わせる。0 申告のサーバーもあるので警告のみ。
         if e.size and got != e.size:
-            stats.errors.append(f"サイズ不一致 {e.path}: 申告 {e.size} / 実際 {got}")
+            stats.errors.append(f"サイズ不一致 {disp(e.path)}: 申告 {e.size} / 実際 {got}")
+        # remote は生バイト表現のまま残す（wipe が照合とDELETEに使うため）
         manifest.append({"remote": e.path, "local": rel, "size": got})
         print(f"  OK {rel} ({human(got)})")
     return manifest
@@ -299,16 +305,16 @@ def remove_entries(ftp: ftplib.FTP, files: list[Entry], dirs: list[Entry],
         try:
             ftp.delete(e.path)
             removed += 1
-            print(f"  削除 {e.path}")
+            print(f"  削除 {disp(e.path)}")
         except Exception as ex:  # noqa: BLE001
-            stats.errors.append(f"削除失敗 {e.path}: {ex}")
+            stats.errors.append(f"削除失敗 {disp(e.path)}: {ex}")
     # 深い階層から順にディレクトリを消す
     for e in sorted(dirs, key=lambda x: x.path.count("/"), reverse=True):
         try:
             ftp.rmd(e.path)
-            print(f"  削除 {e.path}/")
+            print(f"  削除 {disp(e.path)}/")
         except Exception as ex:  # noqa: BLE001
-            stats.errors.append(f"ディレクトリ削除失敗 {e.path}: {ex}")
+            stats.errors.append(f"ディレクトリ削除失敗 {disp(e.path)}: {ex}")
     return removed
 
 
@@ -345,6 +351,25 @@ def cmd_backup(ftp: ftplib.FTP, args) -> int:
     return 0
 
 
+def guard_docroot(entries: list[Entry], remote_root: str, command: str) -> None:
+    """ログイン直下に公開ディレクトリがあるのに --remote-root 未指定なら止める。
+
+    ISP のホームページ領域は public_html の中が Web 公開部分で、ログイン直下には
+    メール等の別データが同居していることがある。未指定のまま破壊的操作をすると
+    (1) 関係ないものまで消す (2) index.html を公開範囲の外に置く、の二重事故になる。
+    """
+    if remote_root:
+        return
+    top_dirs = {e.path for e in entries if e.is_dir and "/" not in e.path}
+    hits = [d for d in DOCROOT_CANDIDATES if d in top_dirs]
+    if hits:
+        raise SystemExit(
+            f"ログイン直下に公開ディレクトリらしき「{hits[0]}」が見つかりました。\n"
+            f"ホームページの実体はこの中の可能性が高いので、\n"
+            f"  --remote-root {hits[0]}\n"
+            f"を付けて {command} をやり直してください。何も変更していません。")
+
+
 def cmd_wipe(ftp: ftplib.FTP, args) -> int:
     # バックアップの実在を確認できない限り、絶対に消さない。
     mpath = os.path.join(args.backup, MANIFEST)
@@ -362,6 +387,7 @@ def cmd_wipe(ftp: ftplib.FTP, args) -> int:
 
     stats = Stats()
     entries = walk(ftp, args.remote_root, stats)
+    guard_docroot(entries, args.remote_root, "wipe")
     files = [e for e in entries if not e.is_dir]
     dirs = [e for e in entries if e.is_dir]
 
@@ -375,11 +401,11 @@ def cmd_wipe(ftp: ftplib.FTP, args) -> int:
     if unsaved:
         raise SystemExit(f"バックアップに含まれないファイルが {len(unsaved)} 個あります。"
                          "中止します。backup を取り直してください。\n"
-                         + "\n".join(f"  - {p}" for p in unsaved[:10]))
+                         + "\n".join(f"  - {disp(p)}" for p in unsaved[:10]))
 
     print(f"以下の {len(files)} ファイル / {len(dirs)} ディレクトリを削除します:\n")
     for e in sorted(files, key=lambda x: x.path):
-        print(f"  {e.path}")
+        print(f"  {disp(e.path)}")
 
     if args.dry_run:
         print("\n--dry-run のため、実際には削除していません。")
@@ -410,6 +436,7 @@ def cmd_redirect(ftp: ftplib.FTP, args) -> int:
         for err in stats.errors:
             print(f"  ! {err}", file=sys.stderr)
         raise SystemExit("一覧に問題があるため、何も変更せず中止します。")
+    guard_docroot(entries, args.remote_root, "redirect")
 
     files = [e for e in entries if not e.is_dir]
     dirs = [e for e in entries if e.is_dir]
@@ -422,7 +449,7 @@ def cmd_redirect(ftp: ftplib.FTP, args) -> int:
     print(f"既存: ファイル {len(files)} 個 / ディレクトリ {len(dirs)} 個 "
           f"→ すべて削除して index.html 1枚 ({human(len(body))}) に置き換えます\n")
     for e in sorted(files, key=lambda x: x.path):
-        print(f"  消える: {e.path}")
+        print(f"  消える: {disp(e.path)}")
 
     if args.dry_run:
         print("\n--dry-run のため、何も変更していません。")
@@ -456,7 +483,7 @@ def cmd_redirect(ftp: ftplib.FTP, args) -> int:
         ok = False
     leftover = sorted(p for p in names if p != target)
     for p in leftover:
-        stats.errors.append(f"残存: {p}")
+        stats.errors.append(f"残存: {disp(p)}")
     stats.errors.extend(f"一覧の行を解釈できず: {u}" for u in unparsed)
 
     print()
@@ -482,7 +509,9 @@ def main() -> int:
     p.add_argument("--port", type=int, default=21)
     p.add_argument("--tls", action="store_true", help="FTPS (明示的 TLS) を使う")
     p.add_argument("--timeout", type=int, default=30)
-    p.add_argument("--encoding", help=f"指定しなければ {'/'.join(ENCODINGS)} を順に試す")
+    p.add_argument("--encoding",
+                   help="ファイル名の表示・保存に使う文字コードの最優先候補 "
+                        f"(既定: {' → '.join(DISPLAY_ENCODINGS)} の順に自動判定)")
     p.add_argument("--remote-root", default="",
                    help="公開ディレクトリ。空ならログイン直後の場所")
     p.add_argument("--dest", default="./hp-backup",
@@ -500,8 +529,13 @@ def main() -> int:
 
     password = os.environ.get("FTP_PASSWORD") or getpass.getpass("FTP パスワード: ")
 
-    ftp, enc = connect_autodetect(args, password)
-    print(f"接続: {args.host} (文字コード {enc})")
+    if args.encoding:
+        if args.encoding in DISPLAY_ENCODINGS:
+            DISPLAY_ENCODINGS.remove(args.encoding)
+        DISPLAY_ENCODINGS.insert(0, args.encoding)
+
+    ftp = connect_raw(args, password)
+    print(f"接続: {args.host}")
     try:
         print(f"カレント: {ftp.pwd()}\n")
     except Exception:  # noqa: BLE001

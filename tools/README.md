@@ -55,8 +55,15 @@ python3 hp_ftp.py redirect --host <FTPサーバー名> --user <ユーザー名> 
 
 ## 対応している古いサーバー
 
-- ファイル名が Shift_JIS の領域（自動判定。化ける場合は `--encoding cp932`）
-- MLSD 非対応（Unix / DOS 形式の LIST に自動フォールバック)
+- ファイル名が Shift_JIS / UTF-8 混在の領域でもOK。FTP セッションは常に
+  生バイトモード (latin-1) で張り、削除・取得には元のバイト列をそのまま
+  送り返すので操作が化けない。表示とローカル保存名だけ utf-8 → cp932 の順で
+  復号する（`--encoding` で優先順の先頭を変更可能）
+- MLSD 非対応（Unix / DOS 形式の LIST に自動フォールバック。LIST は生バイトで
+  受信してから復号するので、変な名前でもセッションが壊れない）
+- ログイン直下に `public_html` 等の公開ディレクトリがある構成では、
+  `--remote-root public_html` を付けない限り wipe / redirect は動かない
+  （メール等の同居データを巻き込まないための安全装置）
 - FTPS が使えるなら `--tls` を付ける（平文 FTP しか無い ISP も多い）
 
 ## 注意
