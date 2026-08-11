@@ -19,6 +19,19 @@ python3 hp_ftp.py wipe --host <FTPサーバー名> --user <ユーザー名> --ba
 python3 hp_ftp.py wipe --host <FTPサーバー名> --user <ユーザー名> --backup ./hp-backup
 ```
 
+## 旧URLを新しいページへ転送したい場合（削除の代わりに）
+
+```bash
+python3 hp_ftp.py redirect --host <FTPサーバー名> --user <ユーザー名> --to https://新しいページのURL/
+```
+
+- 既存ファイルを自動バックアップ（`--dest`、既定 `./hp-backup`）してから全削除し、
+  リダイレクト用の `index.html` 1枚だけを設置する（`REPLACE` と手入力で確定）
+- 生成ページは meta refresh 0 + canonical + noindex + JS フォールバック。
+  旧URLは検索結果から徐々に消え、訪問者は新URLへ飛ぶ
+- **重要: この方式ではポータルで「利用しない」にしないこと。**
+  領域ごと消えるとリダイレクトも消えて、ただの404になる
+
 パスワードは実行時にプロンプトで聞かれる（画面に表示されず、履歴にも残らない）。
 
 ## FTP サーバー名・ユーザー名はどこに書いてある？

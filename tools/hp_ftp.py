@@ -3,9 +3,10 @@
 
 標準ライブラリのみで動くので、pip install は不要。
 
-    python3 hp_ftp.py list   --host www.example.ne.jp --user cb00000
-    python3 hp_ftp.py backup --host www.example.ne.jp --user cb00000 --dest ./backup
-    python3 hp_ftp.py wipe   --host www.example.ne.jp --user cb00000 --backup ./backup
+    python3 hp_ftp.py list     --host www.example.ne.jp --user cb00000
+    python3 hp_ftp.py backup   --host www.example.ne.jp --user cb00000 --dest ./backup
+    python3 hp_ftp.py wipe     --host www.example.ne.jp --user cb00000 --backup ./backup
+    python3 hp_ftp.py redirect --host www.example.ne.jp --user cb00000 --to https://new.example.com/
 
 パスワードは getpass で聞くので、コマンド履歴には残らない。
 環境変数 FTP_PASSWORD に入れておけばそちらを使う。
@@ -16,10 +17,13 @@ from __future__ import annotations
 import argparse
 import ftplib
 import getpass
+import html
+import io
 import json
 import os
 import posixpath
 import sys
+import urllib.parse
 from dataclasses import dataclass, field
 
 # 2000年代の国内 ISP のホームページ領域は、ファイル名が Shift_JIS のことが多い。
@@ -227,6 +231,87 @@ def cmd_list(ftp: ftplib.FTP, args) -> int:
     return 0
 
 
+# 旧URLを開いた人を新ページへ送るページ。meta refresh 0 は検索エンジンにも
+# リダイレクト扱いされ、noindex + canonical で旧URLは検索結果から消えていく。
+REDIRECT_TEMPLATE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex">
+<meta http-equiv="refresh" content="0; url={attr}">
+<link rel="canonical" href="{attr}">
+<title>移転のお知らせ</title>
+</head>
+<body>
+<p>このホームページは移転しました。自動で移動しない場合は、次のリンクをクリックしてください。</p>
+<p><a href="{attr}">{text}</a></p>
+<script>location.replace({js});</script>
+</body>
+</html>
+"""
+
+
+def make_redirect_html(url: str) -> bytes:
+    safe = html.escape(url, quote=True)
+    return REDIRECT_TEMPLATE.format(attr=safe, text=safe,
+                                    js=json.dumps(url)).encode("utf-8")
+
+
+def download_entries(ftp: ftplib.FTP, entries: list[Entry], root: str,
+                     dest: str, stats: Stats) -> list[dict]:
+    """entries のファイルを dest へ保存し、目録リストを返す。"""
+    manifest = []
+    for e in sorted(entries, key=lambda x: x.path):
+        rel = e.path[len(root):].lstrip("/") if root else e.path.lstrip("/")
+        local = os.path.join(dest, *rel.split("/"))
+        if e.is_dir:
+            os.makedirs(local, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(local) or dest, exist_ok=True)
+        try:
+            with open(local, "wb") as fh:
+                ftp.retrbinary(f"RETR {e.path}", fh.write)
+        except Exception as ex:  # noqa: BLE001
+            stats.errors.append(f"取得失敗 {e.path}: {ex}")
+            print(f"  ! 失敗 {rel}")
+            continue
+        got = os.path.getsize(local)
+        # サーバー申告サイズと突き合わせる。0 申告のサーバーもあるので警告のみ。
+        if e.size and got != e.size:
+            stats.errors.append(f"サイズ不一致 {e.path}: 申告 {e.size} / 実際 {got}")
+        manifest.append({"remote": e.path, "local": rel, "size": got})
+        print(f"  OK {rel} ({human(got)})")
+    return manifest
+
+
+def write_manifest(dest: str, host: str, root: str, manifest: list[dict]) -> str:
+    path = os.path.join(dest, MANIFEST)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"host": host, "root": root, "files": manifest},
+                  fh, ensure_ascii=False, indent=2)
+    return path
+
+
+def remove_entries(ftp: ftplib.FTP, files: list[Entry], dirs: list[Entry],
+                   stats: Stats) -> int:
+    removed = 0
+    for e in sorted(files, key=lambda x: x.path):
+        try:
+            ftp.delete(e.path)
+            removed += 1
+            print(f"  削除 {e.path}")
+        except Exception as ex:  # noqa: BLE001
+            stats.errors.append(f"削除失敗 {e.path}: {ex}")
+    # 深い階層から順にディレクトリを消す
+    for e in sorted(dirs, key=lambda x: x.path.count("/"), reverse=True):
+        try:
+            ftp.rmd(e.path)
+            print(f"  削除 {e.path}/")
+        except Exception as ex:  # noqa: BLE001
+            stats.errors.append(f"ディレクトリ削除失敗 {e.path}: {ex}")
+    return removed
+
+
 def cmd_backup(ftp: ftplib.FTP, args) -> int:
     dest = os.path.abspath(args.dest)
     os.makedirs(dest, exist_ok=True)
@@ -247,36 +332,11 @@ def cmd_backup(ftp: ftplib.FTP, args) -> int:
     print(f"対象: ファイル {stats.files} 個 / {human(stats.bytes)}\n")
 
     root = args.remote_root.rstrip("/")
-    manifest = []
-    ok = 0
-    for e in sorted(entries, key=lambda x: x.path):
-        rel = e.path[len(root):].lstrip("/") if root else e.path.lstrip("/")
-        local = os.path.join(dest, *rel.split("/"))
-        if e.is_dir:
-            os.makedirs(local, exist_ok=True)
-            continue
-        os.makedirs(os.path.dirname(local) or dest, exist_ok=True)
-        try:
-            with open(local, "wb") as fh:
-                ftp.retrbinary(f"RETR {e.path}", fh.write)
-        except Exception as ex:  # noqa: BLE001
-            stats.errors.append(f"取得失敗 {e.path}: {ex}")
-            print(f"  ! 失敗 {rel}")
-            continue
-        got = os.path.getsize(local)
-        # サーバー申告サイズと突き合わせる。0 申告のサーバーもあるので警告のみ。
-        if e.size and got != e.size:
-            stats.errors.append(f"サイズ不一致 {e.path}: 申告 {e.size} / 実際 {got}")
-        manifest.append({"remote": e.path, "local": rel, "size": got})
-        ok += 1
-        print(f"  OK {rel} ({human(got)})")
+    manifest = download_entries(ftp, entries, root, dest, stats)
+    mpath = write_manifest(dest, args.host, args.remote_root, manifest)
 
-    with open(os.path.join(dest, MANIFEST), "w", encoding="utf-8") as fh:
-        json.dump({"host": args.host, "root": args.remote_root,
-                   "files": manifest}, fh, ensure_ascii=False, indent=2)
-
-    print(f"\n完了: {ok}/{stats.files} 個を {dest} に保存")
-    print(f"目録: {os.path.join(dest, MANIFEST)}")
+    print(f"\n完了: {len(manifest)}/{stats.files} 個を {dest} に保存")
+    print(f"目録: {mpath}")
     for err in stats.errors:
         print(f"  ! {err}", file=sys.stderr)
     if stats.errors:
@@ -330,27 +390,85 @@ def cmd_wipe(ftp: ftplib.FTP, args) -> int:
         print("中止しました。")
         return 1
 
-    removed = 0
-    for e in sorted(files, key=lambda x: x.path):
-        try:
-            ftp.delete(e.path)
-            removed += 1
-            print(f"  削除 {e.path}")
-        except Exception as ex:  # noqa: BLE001
-            stats.errors.append(f"削除失敗 {e.path}: {ex}")
-
-    # 深い階層から順にディレクトリを消す
-    for e in sorted(dirs, key=lambda x: x.path.count("/"), reverse=True):
-        try:
-            ftp.rmd(e.path)
-            print(f"  削除 {e.path}/")
-        except Exception as ex:  # noqa: BLE001
-            stats.errors.append(f"ディレクトリ削除失敗 {e.path}: {ex}")
-
+    removed = remove_entries(ftp, files, dirs, stats)
     print(f"\n{removed}/{len(files)} ファイルを削除しました。")
     for err in stats.errors:
         print(f"  ! {err}", file=sys.stderr)
     return 1 if stats.errors else 0
+
+
+def cmd_redirect(ftp: ftplib.FTP, args) -> int:
+    """領域の中身をリダイレクトページ 1 枚に置き換える。
+
+    流れ: 全ファイルを自動バックアップ → 全削除 → index.html を設置 → 検証。
+    ホームページ契約そのものは残す前提（ポータルで「利用しない」にすると
+    このリダイレクトごと消えるので注意）。
+    """
+    stats = Stats()
+    entries = walk(ftp, args.remote_root, stats)
+    if stats.errors:
+        for err in stats.errors:
+            print(f"  ! {err}", file=sys.stderr)
+        raise SystemExit("一覧に問題があるため、何も変更せず中止します。")
+
+    files = [e for e in entries if not e.is_dir]
+    dirs = [e for e in entries if e.is_dir]
+    root = args.remote_root.rstrip("/")
+    target = posixpath.join(args.remote_root, "index.html") if args.remote_root \
+        else "index.html"
+    body = make_redirect_html(args.to)
+
+    print(f"リダイレクト先: {args.to}")
+    print(f"既存: ファイル {len(files)} 個 / ディレクトリ {len(dirs)} 個 "
+          f"→ すべて削除して index.html 1枚 ({human(len(body))}) に置き換えます\n")
+    for e in sorted(files, key=lambda x: x.path):
+        print(f"  消える: {e.path}")
+
+    if args.dry_run:
+        print("\n--dry-run のため、何も変更していません。")
+        return 0
+
+    if files:
+        dest = os.path.abspath(args.dest)
+        os.makedirs(dest, exist_ok=True)
+        print(f"\n念のためバックアップを {dest} に取ります:")
+        manifest = download_entries(ftp, entries, root, dest, stats)
+        if stats.errors:
+            for err in stats.errors:
+                print(f"  ! {err}", file=sys.stderr)
+            raise SystemExit("バックアップに失敗があるため、削除せず中止します。")
+        write_manifest(dest, args.host, args.remote_root, manifest)
+
+    if input('置き換えを実行する場合は REPLACE と入力: ').strip() != "REPLACE":
+        print("中止しました。")
+        return 1
+
+    remove_entries(ftp, files, dirs, stats)
+    ftp.storbinary(f"STOR {target}", io.BytesIO(body))
+
+    # 置き換え結果を検証: index.html だけが、正しいサイズで残っていること
+    after, unparsed = list_entries(ftp, args.remote_root)
+    names = {e.path: e for e in after}
+    ok = target in names and not names[target].is_dir
+    if ok and names[target].size and names[target].size != len(body):
+        stats.errors.append(f"index.html のサイズ不一致: "
+                            f"サーバー {names[target].size} / 手元 {len(body)}")
+        ok = False
+    leftover = sorted(p for p in names if p != target)
+    for p in leftover:
+        stats.errors.append(f"残存: {p}")
+    stats.errors.extend(f"一覧の行を解釈できず: {u}" for u in unparsed)
+
+    print()
+    if ok and not leftover:
+        print(f"完了: {target} ({human(len(body))}) だけが残っています。")
+        print("\nブラウザでホームページの URL を開いて、新しいページへ"
+              "飛ぶことを確認してください。")
+        print("注意: ポータルで「利用しない」にするとこのリダイレクトごと消えます。"
+              "契約は「利用する」のまま維持してください。")
+    for err in stats.errors:
+        print(f"  ! {err}", file=sys.stderr)
+    return 0 if ok and not leftover and not stats.errors else 1
 
 
 def main() -> int:
@@ -358,7 +476,7 @@ def main() -> int:
         description="ホームページ領域を FTP でバックアップ / 確認 / 削除する",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
-    p.add_argument("command", choices=["list", "backup", "wipe"])
+    p.add_argument("command", choices=["list", "backup", "wipe", "redirect"])
     p.add_argument("--host", required=True, help="FTP サーバー名")
     p.add_argument("--user", required=True, help="FTP ユーザー名")
     p.add_argument("--port", type=int, default=21)
@@ -367,10 +485,18 @@ def main() -> int:
     p.add_argument("--encoding", help=f"指定しなければ {'/'.join(ENCODINGS)} を順に試す")
     p.add_argument("--remote-root", default="",
                    help="公開ディレクトリ。空ならログイン直後の場所")
-    p.add_argument("--dest", default="./hp-backup", help="backup: 保存先")
+    p.add_argument("--dest", default="./hp-backup",
+                   help="backup/redirect: バックアップ保存先")
     p.add_argument("--backup", default="./hp-backup", help="wipe: 確認に使うバックアップ")
-    p.add_argument("--dry-run", action="store_true", help="wipe: 消さずに一覧だけ出す")
+    p.add_argument("--dry-run", action="store_true",
+                   help="wipe/redirect: 変更せずに対象だけ表示")
+    p.add_argument("--to", help="redirect: 飛ばし先 URL (https://... )")
     args = p.parse_args()
+
+    if args.command == "redirect":
+        u = urllib.parse.urlparse(args.to or "")
+        if u.scheme not in ("http", "https") or not u.netloc:
+            p.error("redirect には --to https://新しいページのURL が必要です")
 
     password = os.environ.get("FTP_PASSWORD") or getpass.getpass("FTP パスワード: ")
 
@@ -382,7 +508,8 @@ def main() -> int:
         print()
 
     try:
-        return {"list": cmd_list, "backup": cmd_backup, "wipe": cmd_wipe}[args.command](ftp, args)
+        return {"list": cmd_list, "backup": cmd_backup, "wipe": cmd_wipe,
+                "redirect": cmd_redirect}[args.command](ftp, args)
     finally:
         try:
             ftp.quit()
