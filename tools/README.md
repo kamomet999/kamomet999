@@ -3,10 +3,11 @@
 手元のマシンのネットワークを実測して、**どこがボトルネックなのか**と
 **何をすれば速くなるのか**を、効果の大きい順に出します。
 
-| OS | 使うファイル |
-|----|--------------|
-| **Windows** | `netcheck.ps1` |
-| macOS / Linux / WSL | `netcheck.sh` |
+| ファイル | 用途 |
+|----------|------|
+| `netcheck.ps1` | **Windows 用。まずこれ。** 宅内・回線・Windows設定をひととおり診断 |
+| `netcheck-wan.ps1` | Windows 用。`netcheck.ps1` で外向きが遅いと出たときの二段目 |
+| `netcheck.sh` | macOS / Linux / WSL 用 |
 
 ## Windows での使い方
 
@@ -48,6 +49,40 @@ powershell -ExecutionPolicy Bypass -File tools\netcheck.ps1 -NoPublic
 # 速度計測のダウンロード量を変える (既定 25MB)
 powershell -ExecutionPolicy Bypass -File tools\netcheck.ps1 -SpeedTestMB 100
 ```
+
+## netcheck-wan.ps1 — 外向きが遅いときの二段目
+
+`netcheck.ps1` で「宅内は正常なのに外向きが遅い」と出たとき、
+**回線全体が遅いのか、特定の相手までの経路だけが遅いのか**を切り分けます。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\netcheck-wan.ps1
+```
+
+やっていることは 4 つです。
+
+1. **宛先を変えてレイテンシを測る** (Cloudflare / Google / Quad9 / OpenDNS)
+   相手によって差が出れば、回線ではなく経路の問題だと分かります。
+2. **同じ相手に IPv6 でも測る**
+   IPv4 が遅く IPv6 が速ければ、IPv4 だけが混雑した PPPoE 経路を通っています。
+   日本の光回線でいちばん多いパターンで、IPoE 化で直ります。
+3. **ダウンロード元を変えて速度を測る** (Cloudflare / Linode 東京 / GitHub)
+   全部遅ければ回線、1 つだけ遅ければピアリングの問題です。
+4. **経路を表示する** (`tracert`)
+   どのホップから遅くなっているかが見えます。
+
+### オプション
+
+```powershell
+# 1ソースあたりの上限を変える (既定 15MB / 20秒)
+powershell -ExecutionPolicy Bypass -File .\netcheck-wan.ps1 -CapMB 30 -CapSeconds 30
+
+# 経路表示 (tracert) を省く
+powershell -ExecutionPolicy Bypass -File .\netcheck-wan.ps1 -SkipTrace
+```
+
+> 混雑が原因かどうかは、**混雑時間帯 (21〜翌1時) と昼間の 2 回**測って
+> 比べるのがいちばん確実です。
 
 ## macOS / Linux / WSL での使い方
 

@@ -437,10 +437,18 @@ if ($gwStat.Ok -and $gwKind -eq 'private') {
     Write-Info "(このゲートウェイは宅内ルーターではないため、宅内区間の切り分けには使えません)"
 }
 
+# 宅内 (自分〜ルーター) が健全かどうか。
+# ここが健全なら、外向きの不調の原因は宅内ではなく回線側だと言い切れる。
+$lanClean = ($gwStat.Ok -and $gwKind -eq 'private' -and $gwStat.Avg -le 5 -and $gwStat.LossPct -eq 0)
+
 if ($netStat.Ok) {
     if ($netStat.Avg -gt 50) {
         Write-Warn "インターネットまで $($netStat.Avg) ms。やや遅いです。"
-        Add-Rec 3 "外向きレイテンシが $($netStat.Avg) ms あります。VPN やプロキシを切り、それでも改善しないなら ISP 側 (特に PPPoE の輻輳) を疑ってください。"
+        if ($lanClean) {
+            Add-Rec 2 "外向きレイテンシが $($netStat.Avg) ms あります。宅内 (ルーターまで $($gwStat.Avg) ms) は正常なので、原因は回線側で確定です。ISP の輻輳か、その宛先までの経路が悪化しています。"
+        } else {
+            Add-Rec 3 "外向きレイテンシが $($netStat.Avg) ms あります。VPN やプロキシを切り、それでも改善しないなら ISP 側 (特に PPPoE の輻輳) を疑ってください。"
+        }
     } else {
         Write-Ok "インターネットまで $($netStat.Avg) ms。"
     }
@@ -450,7 +458,13 @@ if ($netStat.Ok) {
     }
     if ($netStat.Jitter -gt 30) {
         Write-Warn "ジッターが $($netStat.Jitter) ms と大きく、通話やビデオ会議が乱れやすい状態です。"
-        Add-Rec 3 "ジッター $($netStat.Jitter) ms は大きすぎます。Wi-Fi の干渉かルーターの処理能力不足が原因です。有線化を試してください。"
+        if ($lanClean) {
+            Add-Rec 2 "ジッター $($netStat.Jitter) ms は大きすぎます。ただし宅内 (ルーターまで $($gwStat.Avg) ms / ロス 0%) は正常なので、原因は宅内ではなく回線側です。宅内をいじっても直りません。"
+        } elseif ($isWifi) {
+            Add-Rec 3 "ジッター $($netStat.Jitter) ms は大きすぎます。Wi-Fi の干渉が原因の可能性が高いので、有線化を試してください。"
+        } else {
+            Add-Rec 3 "ジッター $($netStat.Jitter) ms は大きすぎます。ルーターの処理能力不足か回線側の問題です。"
+        }
     }
 }
 
@@ -493,6 +507,18 @@ if ($dnsResults.Count -gt 1 -and $curDns) {
     } else {
         Write-Ok "DNS の応答速度は妥当です。"
     }
+
+    # 公開リゾルバ同士で大きく差が出るのは DNS の優劣ではなく、
+    # 特定の宛先への経路だけが悪化しているサインになる
+    $pub = @($dnsResults | Where-Object { $_.Ip -ne $curDns })
+    if ($pub.Count -ge 2) {
+        $fast = ($pub | Sort-Object Ms | Select-Object -First 1)
+        $slow = ($pub | Sort-Object Ms -Descending | Select-Object -First 1)
+        if (($slow.Ms - $fast.Ms) -gt 50) {
+            Write-Warn "公開 DNS 間で応答時間の差が大きすぎます ($($fast.Ip) $($fast.Ms)ms / $($slow.Ip) $($slow.Ms)ms)。"
+            Add-Rec 2 "$($slow.Ip) だけが $($slow.Ms) ms と極端に遅く、$($fast.Ip) は $($fast.Ms) ms で届いています。回線全体ではなく $($slow.Ip) 方向の経路だけが悪化している可能性が高いです。netcheck-wan.ps1 で宛先ごとに切り分けてください。"
+        }
+    }
 }
 
 # ================================================================= 5. 速度
@@ -506,19 +532,35 @@ if ($dl) {
     Write-Info ("下り速度       : {0} Mbps  ({1}MB / {2}秒)" -f $dl.Mbps, $dl.MB, $dl.Seconds)
     if ($dl.LoadedMs -and $netStat.Ok) {
         $bloat = [math]::Round($dl.LoadedMs - $netStat.Avg, 1)
-        Write-Info ("負荷時レイテンシ: {0} ms  (アイドル時 {1} ms / 増加 +{2} ms)" -f $dl.LoadedMs, $netStat.Avg, $bloat)
+        $sign = ''
+        if ($bloat -ge 0) { $sign = '+' }
+        Write-Info ("負荷時レイテンシ: {0} ms  (アイドル時 {1} ms / 変化 {2}{3} ms)" -f $dl.LoadedMs, $netStat.Avg, $sign, $bloat)
         if ($bloat -gt 200) {
-            Write-Bad "ダウンロード中にレイテンシが +$bloat ms 悪化しています。重度のバッファブロートです。"
+            Write-Bad "ダウンロード中にレイテンシが $sign$bloat ms 悪化しています。重度のバッファブロートです。"
             Add-Rec 2 "バッファブロートが深刻です (負荷時に +$bloat ms)。誰かが大きなダウンロードをすると、家じゅうの通信がカクつきます。ルーターの QoS / SQM を有効にしてください。回線速度はそのままで体感が劇的に改善します。非対応ルーターなら、これが買い替えの一番の理由です。"
         } elseif ($bloat -gt 60) {
-            Write-Warn "ダウンロード中にレイテンシが +$bloat ms 悪化しています (バッファブロート)。"
+            Write-Warn "ダウンロード中にレイテンシが $sign$bloat ms 悪化しています (バッファブロート)。"
             Add-Rec 3 "負荷時にレイテンシが +$bloat ms 悪化します。ルーターに QoS / SQM 設定があれば有効にしてください。"
         } else {
-            Write-Ok "負荷をかけてもレイテンシは安定しています (+$bloat ms)。"
+            Write-Ok "負荷をかけてもレイテンシは安定しています ($sign$bloat ms)。"
         }
     }
-    if ($isWifi -and $dl.Mbps -lt 100) {
-        Add-Rec 2 "下り $($dl.Mbps) Mbps は Wi-Fi 経由としても遅めです。5GHz 帯への切り替えか有線化で改善する可能性が高いです。"
+    if ($dl.Mbps -lt 30) {
+        Write-Bad "下り $($dl.Mbps) Mbps しか出ていません。回線種別を問わず異常に遅い値です。"
+        if ($lanClean) {
+            Add-Rec 1 "下り $($dl.Mbps) Mbps は異常です。宅内 (ルーターまで $($gwStat.Avg) ms / ロス 0%) もリンク速度 ($adSpeed) も正常なので、PC や宅内 LAN の問題ではありません。回線側かこの宛先までの経路が原因です。netcheck-wan.ps1 で切り分けてください。"
+        } else {
+            Add-Rec 1 "下り $($dl.Mbps) Mbps は異常です。まず宅内 (Wi-Fi / ケーブル / ルーター) を確認してください。"
+        }
+    } elseif ($dl.Mbps -lt 100) {
+        Write-Warn "下り $($dl.Mbps) Mbps。光回線であれば遅めです。"
+        if ($isWifi) {
+            Add-Rec 2 "下り $($dl.Mbps) Mbps は Wi-Fi 経由としても遅めです。5GHz 帯への切り替えか有線化で改善する可能性が高いです。"
+        } else {
+            Add-Rec 2 "下り $($dl.Mbps) Mbps は有線としては遅めです。回線側か経路の問題を疑ってください。"
+        }
+    } else {
+        Write-Ok "下り $($dl.Mbps) Mbps 出ています。"
     }
 } else {
     Write-Info "速度計測に失敗しました。https://speed.cloudflare.com で手動で測ってください。"
