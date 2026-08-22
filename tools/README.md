@@ -10,14 +10,34 @@
 
 ## Windows での使い方
 
-PowerShell を開いて、リポジトリのルートで:
+### A. リポジトリをクローンしていない場合 (いちばん手軽)
+
+PowerShell を開いて、そのまま貼り付けてください。
 
 ```powershell
+cd $env:USERPROFILE\Downloads
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -UseBasicParsing -OutFile netcheck.ps1 `
+  -Uri "https://raw.githubusercontent.com/kamomet999/kamomet999/refs/heads/claude/fastest-network-setup-xhpuy1/tools/netcheck.ps1"
+Unblock-File .\netcheck.ps1
+powershell -ExecutionPolicy Bypass -File .\netcheck.ps1
+```
+
+`C:\Windows\System32` のままだと書き込めないので、`cd` を省略しないでください。
+
+### B. リポジトリをクローンしている場合
+
+```powershell
+cd (クローン先のパス)
 powershell -ExecutionPolicy Bypass -File tools\netcheck.ps1
 ```
 
-管理者権限もインストールも不要です。Windows PowerShell 5.1 と PowerShell 7 の
+どちらも管理者権限は不要です。Windows PowerShell 5.1 と PowerShell 7 の
 どちらでも動きます。1〜2 分で終わります。
+
+> `-File` に渡したパスが存在しないと
+> 「`-File` パラメーターの引数 '...' は存在しません」というエラーになります。
+> その場合は今いるフォルダが違うだけなので、A の手順を使ってください。
 
 ### オプション
 
