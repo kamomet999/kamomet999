@@ -1,0 +1,4 @@
+# PowerShell は Windows で扱うため CRLF に固定する
+*.ps1 text eol=crlf
+# シェルスクリプトは LF に固定する
+*.sh text eol=lf
