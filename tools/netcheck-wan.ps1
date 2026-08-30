@@ -233,10 +233,59 @@ if (-not $SkipTrace) {
     Write-Info "いちばん遅い相手 ($traceTarget) までの経路を表示します。30秒ほどかかります。"
     Write-Info "自分のルーター (192.168.x.1) の次のホップから急に遅くなっていれば、ISP 側です。"
     Write-Host ""
+    $traceOut = $null
     try {
-        & tracert -d -h 12 -w 800 $traceTarget 2>$null | ForEach-Object { Write-Host "         $_" }
+        $traceOut = & tracert -d -h 12 -w 800 $traceTarget 2>$null
     } catch {
         Write-Info "tracert を実行できませんでした。"
+    }
+    if ($traceOut) {
+        foreach ($l in $traceOut) { Write-Host "         $l" }
+
+        # 各ホップの「番号」と「最小 RTT」を取り出す。
+        # 表示言語に依存しないよう、数値と ms だけを見る。
+        $hops = New-Object System.Collections.ArrayList
+        foreach ($l in $traceOut) {
+            if ($l -match '^\s*(\d+)\s+(.*)$') {
+                $hopNo = [int]$Matches[1]
+                $rest  = $Matches[2]
+                $msList = @([regex]::Matches($rest, '(\d+)\s*ms') | ForEach-Object { [int]$_.Groups[1].Value })
+                if ($msList.Count -gt 0) {
+                    $addr = ''
+                    $am = [regex]::Match($rest, '([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9a-fA-F:]{6,})\s*$')
+                    if ($am.Success) { $addr = $am.Value }
+                    $null = $hops.Add([PSCustomObject]@{
+                        N    = $hopNo
+                        Ms   = ($msList | Measure-Object -Minimum).Minimum
+                        Addr = $addr
+                    })
+                }
+            }
+        }
+
+        $gwHop    = $hops | Where-Object { $_.N -eq 1 } | Select-Object -First 1
+        $ispHop   = $hops | Where-Object { $_.N -ge 2 } | Sort-Object N | Select-Object -First 1
+        $lastHop  = $hops | Sort-Object N -Descending | Select-Object -First 1
+
+        if ($gwHop -and $ispHop -and $lastHop -and $lastHop.N -gt $ispHop.N) {
+            $access   = $ispHop.Ms  - $gwHop.Ms      # 自宅ルーター 〜 ISP入口
+            $internet = $lastHop.Ms - $ispHop.Ms     # ISP入口 〜 目的地
+            Write-Host ""
+            Write-Info ("アクセス区間   (自宅ルーター 〜 hop{0})  : 約 {1} ms" -f $ispHop.N, $access)
+            Write-Info ("インターネット区間 (hop{0} 〜 hop{1})      : 約 {2} ms" -f $ispHop.N, $lastHop.N, $internet)
+            Write-Host ""
+            if ($access -gt 25) {
+                $script:HighAccessLatency = $access
+                Write-Bad "遅延のほぼ全部がアクセス区間 (自宅から ISP に入るまで) で発生しています。"
+                Write-Info "インターネット側の経路は正常です。ここが遅いのは回線そのものの性質です。"
+                Write-Info "参考: 光回線(FTTH) なら 3〜10ms、CATV で 15〜30ms、"
+                Write-Info "      5G/WiMAX などの無線ホームルーターで 30〜60ms が目安です。"
+            } elseif ($internet -gt $access * 2 -and $internet -gt 30) {
+                Write-Warn "アクセス区間は正常で、インターネット側の経路で遅延しています。"
+            } else {
+                Write-Ok "アクセス区間・インターネット区間ともに妥当です。"
+            }
+        }
     }
 }
 
@@ -266,10 +315,15 @@ if ($allSlow) {
     Write-Info "     → ルーターの管理画面で接続方式を確認し、IPoE (v6プラス / MAP-E /"
     Write-Info "        DS-Lite / transix 等) に対応していれば有効化してください。"
     Write-Info ""
-    Write-Info "  3. ルーターの性能不足または不調"
+    Write-Info "  3. 無線回線 (5G / WiMAX などのホームルーター) の基地局混雑"
+    Write-Info "     → 上の 4 で「アクセス区間が遅い」と出ていれば、これが濃厚です。"
+    Write-Info "     → 設定では直せません。ルーターを窓際・高い位置に移して電波を改善するか、"
+    Write-Info "        光回線 (FTTH) に変更するかの二択になります。"
+    Write-Info ""
+    Write-Info "  4. ルーターの性能不足または不調"
     Write-Info "     → まずルーターを再起動してください。それで直るなら熱か処理落ちです。"
     Write-Info ""
-    Write-Info "  4. ISP 側の輻輳 (この時間帯だけ遅い)"
+    Write-Info "  5. ISP 側の輻輳 (この時間帯だけ遅い)"
     Write-Info "     → 昼間にもう一度このスクリプトを実行して比較してください。"
 } elseif ($mixed) {
     Write-Bad "ダウンロード元によって速度が大きく違います ($($worst.Name) が遅く、$($best.Name) は出ています)。"
@@ -301,6 +355,13 @@ if (($dlResults | Where-Object { -not $_.Steady }).Count -gt 0) {
     Write-Host ""
     Write-Warn "転送が短時間で終わったソースがあります。表示された速度は実力より低い値です。"
     Write-Info "正確に測るには上限を上げてください:  -CapMB 200 -CapSeconds 30"
+}
+
+if ($script:HighAccessLatency) {
+    Write-Host ""
+    Write-Bad "最も重要: 遅延の原因はアクセス区間 (約 $($script:HighAccessLatency) ms) です。"
+    Write-Info "PC・宅内 LAN・ルーターの設定をどう変えても、この区間は速くなりません。"
+    Write-Info "回線そのものを変えるか、無線ならアンテナ環境を改善するしかありません。"
 }
 
 if ($v6Better) {
