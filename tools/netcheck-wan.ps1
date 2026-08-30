@@ -11,7 +11,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$CapMB      = 15,   # 1 ソースあたり最大何 MB 落とすか
+    [int]$CapMB      = 80,   # 1 ソースあたり最大何 MB 落とすか
     [int]$CapSeconds = 20,   # 1 ソースあたり最大何秒かけるか
     [switch]$SkipTrace       # 経路表示 (tracert) を省略する
 )
@@ -74,17 +74,41 @@ function Measure-Source([string]$Url, [int]$CapBytes, [int]$CapSec) {
         $buf   = New-Object byte[] 131072
         $total = 0L
         $sw    = [System.Diagnostics.Stopwatch]::StartNew()
+
+        # TCP はコネクション開始直後、輻輳ウィンドウが小さく本来の速度が出ない
+        # (スロースタート)。最初の 1.5 秒を捨てて、そこから先だけで速度を出す。
+        $warmupSec   = 1.5
+        $steadyStart = $null
+        $steadyBytes = 0L
+
         while ($true) {
             $n = $stream.Read($buf, 0, $buf.Length)
             if ($n -le 0) { break }
             $total += $n
+            if ($sw.Elapsed.TotalSeconds -ge $warmupSec) {
+                if ($null -eq $steadyStart) { $steadyStart = $sw.Elapsed.TotalSeconds }
+                else { $steadyBytes += $n }
+            }
             if ($total -ge $CapBytes) { break }
             if ($sw.Elapsed.TotalSeconds -ge $CapSec) { break }
         }
         $sw.Stop()
         if ($total -lt 200000 -or $sw.Elapsed.TotalSeconds -le 0.05) { return $null }
+
+        $overall = ($total * 8.0) / $sw.Elapsed.TotalSeconds / 1000000.0
+        $mbps    = $overall
+        $steady  = $false
+        if ($null -ne $steadyStart) {
+            $steadySec = $sw.Elapsed.TotalSeconds - $steadyStart
+            if ($steadySec -ge 0.5 -and $steadyBytes -gt 500000) {
+                $mbps   = ($steadyBytes * 8.0) / $steadySec / 1000000.0
+                $steady = $true
+            }
+        }
         [PSCustomObject]@{
-            Mbps    = [math]::Round(($total * 8.0) / $sw.Elapsed.TotalSeconds / 1000000.0, 1)
+            Mbps    = [math]::Round($mbps, 1)
+            Overall = [math]::Round($overall, 1)
+            Steady  = $steady
             MB      = [math]::Round($total / 1000000.0, 1)
             Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
         }
@@ -184,14 +208,18 @@ $sources = @(
     [PSCustomObject]@{ Name='GitHub (Fastly CDN)';  Url='https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/PowerShell-7.4.6-win-x64.zip' }
 )
 $dlResults = New-Object System.Collections.ArrayList
+$dlFailed  = New-Object System.Collections.ArrayList
 foreach ($s in $sources) {
     Write-Host ("         {0,-22} " -f $s.Name) -NoNewline
     $r = Measure-Source $s.Url $capBytes $CapSeconds
     if ($r) {
-        Write-Host ("{0,7} Mbps   ({1}MB / {2}秒)" -f $r.Mbps, $r.MB, $r.Seconds)
-        $null = $dlResults.Add([PSCustomObject]@{ Name=$s.Name; Mbps=$r.Mbps })
+        $note = ''
+        if (-not $r.Steady) { $note = '  ※転送が短すぎて立ち上がり中に終了。実力より低く出ています' }
+        Write-Host ("{0,7} Mbps   ({1}MB / {2}秒){3}" -f $r.Mbps, $r.MB, $r.Seconds, $note)
+        $null = $dlResults.Add([PSCustomObject]@{ Name=$s.Name; Mbps=$r.Mbps; Steady=$r.Steady })
     } else {
         Write-Host "計測できず"
+        $null = $dlFailed.Add($s.Name)
     }
 }
 
@@ -254,12 +282,25 @@ if ($allSlow) {
     Write-Warn "速度は出ていますが、特定の相手へのレイテンシだけが悪化しています。"
     Write-Info "  → その相手までの経路の問題です。日常利用への影響は限定的です。"
 } elseif ($dlResults.Count -ge 2) {
-    Write-Ok "どのダウンロード元でも十分な速度が出ています。"
+    Write-Ok "計測できたダウンロード元では十分な速度が出ています。"
 } elseif ($dlResults.Count -eq 1) {
     Write-Warn "1 ソースしか計測できませんでした ($($dlResults[0].Name): $($dlResults[0].Mbps) Mbps)。"
     Write-Info "比較対象が無いため、経路固有の問題かどうかは判定できません。時間をおいて再実行してください。"
 } else {
     Write-Warn "ダウンロード計測ができませんでした。ネットワークが不安定な可能性があります。"
+}
+
+if ($dlFailed.Count -gt 0 -and $dlResults.Count -gt 0) {
+    Write-Host ""
+    Write-Warn "$($dlFailed -join ' / ') にはそもそも接続できませんでした。"
+    Write-Info "他のソースは取得できているので、回線ではなくその相手への経路だけが"
+    Write-Info "遮断されているか、極端に劣化しています。ブラウザで直接開けるか確認してください。"
+}
+
+if (($dlResults | Where-Object { -not $_.Steady }).Count -gt 0) {
+    Write-Host ""
+    Write-Warn "転送が短時間で終わったソースがあります。表示された速度は実力より低い値です。"
+    Write-Info "正確に測るには上限を上げてください:  -CapMB 200 -CapSeconds 30"
 }
 
 if ($v6Better) {
